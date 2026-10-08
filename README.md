@@ -124,7 +124,15 @@ of the archive that holds only your favorite channels.
   it you go to www.innercity-life.com/login and come back after. Without
   `AUTH_PUBLIC_JWK` the site answers 503.
 
-### Set up
+### Deploy
+
+It runs on the Vercel project `channel`, connected to `codemandy/channel`, so
+pushing to `main` deploys. The domain is `channel.innercity-life.com` (a CNAME
+at Namecheap to the target `vercel domains verify channel.innercity-life.com`
+shows). The `*.vercel.app` addresses are behind Vercel's own login; the domain
+is behind the hub's.
+
+### Set up from scratch
 
 ```bash
 vercel link --yes --project channel
