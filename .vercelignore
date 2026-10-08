@@ -1,0 +1,10 @@
+# Upload only what the online Channel runs. The archive itself reaches it
+# through R2 (publish.py), never through a deploy.
+/*
+!/api
+!/server.py
+!/style.css
+!/r2.py
+!/session_token.py
+!/requirements.txt
+!/vercel.json

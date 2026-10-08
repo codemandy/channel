@@ -1,0 +1,3 @@
+# Only for the online Channel on Vercel (api/index.py checks the hub login).
+# The Mac app and publish.py use the standard library alone.
+cryptography>=43

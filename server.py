@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serve the local Are.na archive."""
+"""Serve the Channel archive: on the Mac inside the app, online as channel.innercity-life.com (api/index.py)."""
 
 from __future__ import annotations
 
@@ -27,6 +27,9 @@ THUMBS = Path(os.getenv("ARENA_THUMBS", ASSETS.parent / "thumbs"))
 THUMB_EDGE = 800
 THUMB_MIN_BYTES = 250_000
 READ_ONLY = os.getenv("ARENA_READONLY") == "1"
+# The online copy (api/index.py): read-only, favorites only, part of innercity-life.com.
+ONLINE = os.getenv("CHANNEL_ONLINE") == "1"
+HUB_URL = "https://www.innercity-life.com"
 # How a channel lays out its blocks; the first is the default.
 BLOCK_VIEWS = ("large", "small", "stack", "abc")
 
@@ -464,7 +467,7 @@ def layout(title: str, body: str) -> str:
     return f"""<!doctype html><html lang='en'><head><meta charset='utf-8'>
 <meta name='viewport' content='width=device-width,initial-scale=1'>
 <title>{esc(title)} · CHANNEL</title><link rel='stylesheet' href='/style.css'></head>
-<body><header class='topbar'><a class='wordmark' href='/'>CHANNEL</a><nav class='main-nav'><a href='/'>CHANNEL</a><button class='update-button' id='update-button' type='button' hidden>CHECK FOR UPDATES</button></nav></header>
+<body><header class='topbar'><a class='wordmark' href='/'>CHANNEL</a><nav class='main-nav'><a href='/'>CHANNEL</a>{f"<a href='{HUB_URL}'>INNERCITY ↗</a>" if ONLINE else ""}<button class='update-button' id='update-button' type='button' hidden>CHECK FOR UPDATES</button></nav></header>
 <main>{body}</main><div class='modal' id='post-modal' hidden role='dialog' aria-modal='true' aria-label='Post detail'>
 <div class='modal-backdrop' data-close-modal></div><section class='modal-panel'>
 <button class='modal-close' type='button' data-close-modal aria-label='Close post'>CLOSE ×</button>
@@ -1087,7 +1090,7 @@ def block_card(row: sqlite3.Row) -> str:
     note_markup = f"<p class='block-note'{'' if note else ' hidden'}>{esc(note)}</p>"
     remove = ""
     draggable = ""
-    if "parent_channel_id" in row.keys():
+    if "parent_channel_id" in row.keys() and not READ_ONLY:
         remove = f"<form class='block-remove' method='post' action='/remove-block'><input type='hidden' name='channel_id' value='{row['parent_channel_id']}'><input type='hidden' name='block_id' value='{row['id']}'><button type='submit'>REMOVE</button></form>"
         draggable = f" draggable='true' data-draggable-block data-select-id='{row['id']}'"
     return f"<article class='block' data-type='{esc(row['type'])}' data-block-id='{row['id']}'{source_attribute}{download}{draggable}><div class='block-visual'>{visual}{remove}</div><div class='block-meta'><span>{kind}</span><span>{esc(row['author_name'])}</span>{source}</div><h3>{title_markup(row['title'])}</h3>{note_markup}</article>"
@@ -1594,8 +1597,11 @@ class Handler(BaseHTTPRequestHandler):
         categories = connection.execute("SELECT name FROM categories ORDER BY lower(name)").fetchall()
         favorites = connection.execute("SELECT id, title, slug FROM channels WHERE favorite = 1 ORDER BY lower(title)").fetchall()
         connection.close()
-        cards = "".join(f"<a class='channel-card' href='/channel/{row['id']}' data-drop-channel='{row['id']}' draggable='true' data-draggable-channel='{row['id']}' data-select-id='{row['id']}'><span class='eyebrow category-chip' data-category-link data-category-url='/?sort=category&direction=asc&category={quote(row['category'] or '')}'>{'★ ' if row['favorite'] else ''}{esc(row['category'] or 'UNCATEGORIZED').upper()} · {row['block_count']} BLOCKS</span><h2>{title_markup(row['title'] or row['slug'])}</h2><p>{esc(row['description'])}</p></a>" for row in channels)
-        empty = '<div class="notice">No channels imported yet.</div>'
+        def drag(channel_id: int) -> str:
+            return "" if READ_ONLY else f" data-drop-channel='{channel_id}' draggable='true' data-draggable-channel='{channel_id}' data-select-id='{channel_id}'"
+
+        cards = "".join(f"<a class='channel-card' href='/channel/{row['id']}' {drag(row['id'])}><span class='eyebrow category-chip' data-category-link data-category-url='/?sort=category&direction=asc&category={quote(row['category'] or '')}'>{'★ ' if row['favorite'] else ''}{esc(row['category'] or 'UNCATEGORIZED').upper()} · {row['block_count']} BLOCKS</span><h2>{title_markup(row['title'] or row['slug'])}</h2><p>{esc(row['description'])}</p></a>" for row in channels)
+        empty = '<div class="notice">No favorite channels yet. Star a channel in the Mac app to show it here.</div>' if ONLINE else '<div class="notice">No channels imported yet.</div>'
         filtered = bool(category or favorites_only)
         favorites_param = "&favorites=1" if favorites_only else ""
         next_abc_direction = "desc" if sort == "abc" and direction == "ASC" else "asc"
@@ -1605,10 +1611,12 @@ class Handler(BaseHTTPRequestHandler):
         favorite_links = "".join(f"<a href='/channel/{row['id']}'>{title_markup(row['title'] or row['slug'])}</a>" for row in favorites) or "<em>Star a channel to pin it here</em>"
         category_links = "".join(f"<a class='{('active' if row['name'] == category else '')}' href='/?sort=category&direction=asc&category={quote(row['name'])}'>{esc(row['name'])}</a>" for row in categories) or "<em>No categories yet</em>"
         search = "<form method='get' action='/search' role='search' class='search-form'><label class='sr-only' for='archive-search'>Search archive</label><input id='archive-search' name='q' type='search' placeholder='Search archive' autocomplete='off'><button type='submit'>SEARCH</button></form>"
-        controls = f"<div class='view-line'><nav class='view-tabs'>{show_tabs}</nav><p class='view-label'>SORT</p><nav class='view-tabs'>{sort_tabs}</nav><p class='view-label channel-count' id='channel-count'>{len(channels)} channels</p>{select_button('channels')}{search}</div>"
-        rows = [("SHOW", controls), ("FAVORITES", f"<div class='favorite-links'>{favorite_links}</div>"), ("CATEGORIES", f"<div class='category-links'>{category_links}</div>")]
+        # Online every channel is a favorite, so ALL/FAVORITES has nothing to choose between.
+        show_nav = "" if ONLINE else f"<nav class='view-tabs'>{show_tabs}</nav>"
+        controls = f"<div class='view-line'>{show_nav}<p class='view-label'>SORT</p><nav class='view-tabs'>{sort_tabs}</nav><p class='view-label channel-count' id='channel-count'>{len(channels)} channels</p>{select_button('channels')}{search}</div>"
+        rows = [("FAVORITES" if ONLINE else "SHOW", controls)] + ([] if ONLINE else [("FAVORITES", f"<div class='favorite-links'>{favorite_links}</div>")]) + [("CATEGORIES", f"<div class='category-links'>{category_links}</div>")]
         view = "<section class='view-panel'>" + "".join(f"<div class='view-row'><p class='view-label'>{label}</p>{content}</div>" for label, content in rows) + "</section>"
-        create = "<section class='editor-panel'><p class='eyebrow'>EDITING</p><div class='editing-actions'><form method='post' action='/create-channel' class='editor-form'><input name='title' placeholder='New channel title' required><input name='description' placeholder='Description'><input name='category' placeholder='Category'><button type='submit'>CREATE CHANNEL</button></form><form method='post' action='/create-category' class='category-form'><input name='category' placeholder='New category' required><button type='submit'>CREATE CATEGORY</button></form></div></section>"
+        create = "" if READ_ONLY else "<section class='editor-panel'><p class='eyebrow'>EDITING</p><div class='editing-actions'><form method='post' action='/create-channel' class='editor-form'><input name='title' placeholder='New channel title' required><input name='description' placeholder='Description'><input name='category' placeholder='Category'><button type='submit'>CREATE CHANNEL</button></form><form method='post' action='/create-category' class='category-form'><input name='category' placeholder='New category' required><button type='submit'>CREATE CATEGORY</button></form></div></section>"
         self.send_html(layout("Channels", f"{view}{create}<section class='channel-grid' data-select-kind='channels'>{cards or empty}</section>{selection_bar('channels')}"))
 
     def view(self, query_string: str) -> None:
@@ -1645,7 +1653,8 @@ class Handler(BaseHTTPRequestHandler):
         facts = f"<p class='channel-facts'><span>{esc(channel['visibility'] or 'unknown').upper()}</span><span aria-hidden='true'>·</span>{category_chip}<span aria-hidden='true'>·</span><span>{len(blocks)} {'BLOCK' if len(blocks) == 1 else 'BLOCKS'}</span>{updated_fact}</p>"
         title = f"<h1 class='channel-title' data-channel-field='title'{editable} aria-label='Channel name'>{title_markup(channel['title'] or channel['slug'])}</h1>"
         description = f"<p class='channel-description' data-channel-field='description'{editable} data-placeholder='Add a description' aria-label='Description'>{esc(channel['description'])}</p>" if not READ_ONLY or channel["description"] else ""
-        star = f"<form method='post' action='/toggle-favorite'><input type='hidden' name='channel_id' value='{channel_id}'><button class='icon-button star-button' type='submit' aria-pressed='{'true' if channel['favorite'] else 'false'}' title='{'Remove from favorites' if channel['favorite'] else 'Add to favorites'}'>{'★' if channel['favorite'] else '☆'}</button></form>"
+        # Read-only shows the star without a button; online every channel has one, so none.
+        star = "" if ONLINE else f"<span class='icon-button star-button' aria-label='{'Favorite' if channel['favorite'] else 'Not a favorite'}'>{'★' if channel['favorite'] else '☆'}</span>" if READ_ONLY else f"<form method='post' action='/toggle-favorite'><input type='hidden' name='channel_id' value='{channel_id}'><button class='icon-button star-button' type='submit' aria-pressed='{'true' if channel['favorite'] else 'false'}' title='{'Remove from favorites' if channel['favorite'] else 'Add to favorites'}'>{'★' if channel['favorite'] else '☆'}</button></form>"
         menu = "" if READ_ONLY else "<details class='channel-menu'><summary class='icon-button' title='More' aria-label='More actions'>⋯</summary><div class='popover menu-popover'><button type='button' class='danger' data-delete-channel>DELETE CHANNEL…</button></div></details>"
         delete_dialog = "" if READ_ONLY else f"<dialog class='batch-dialog' id='delete-channel-dialog'><form method='post' action='/delete-channel'><input type='hidden' name='channel_id' value='{channel_id}'><p class='eyebrow'>DELETE CHANNEL</p><p class='batch-question'>Delete “{esc(channel['title'])}”?</p><p class='batch-hint'>Its blocks are deleted with their files, unless a block is also in another channel. This can’t be undone.</p><div class='batch-actions'><button type='button' data-dialog-cancel>CANCEL</button><button type='submit' class='danger'>DELETE CHANNEL</button></div></form></dialog>"
         heading = f"<section class='channel-heading' data-channel-id='{channel_id}'><div class='channel-topline'><a class='back' href='/'>← BACK</a><div class='channel-tools'>{star}{menu}</div></div>{facts}{title}{description}</section>"

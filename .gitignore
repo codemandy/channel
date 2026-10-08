@@ -11,3 +11,8 @@ thumbs/
 # Local runtime logs
 *.log
 build.noindex/
+
+# Local R2 keys (scripts/set-r2-keys.sh) and the Vercel link
+.env.local
+.vercel/
+public/

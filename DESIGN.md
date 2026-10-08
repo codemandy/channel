@@ -1,4 +1,4 @@
-# Are.na Archive Design System
+# Channel Design System
 
 ## Direction
 

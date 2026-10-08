@@ -15,11 +15,11 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 swiftc -O -swift-version 5 -target "$(uname -m)-apple-macos13.0" \
-  -o "$APP/Contents/MacOS/ArenaArchive" "$ROOT/mac/ArenaArchive.swift" "$ROOT/mac/MenuBar.swift"
+  -o "$APP/Contents/MacOS/Channel" "$ROOT/mac/Channel.swift" "$ROOT/mac/MenuBar.swift"
 
-cp "$ROOT/server.py" "$ROOT/style.css" "$ROOT/arena_archive.py" "$APP/Contents/Resources/"
+cp "$ROOT/server.py" "$ROOT/style.css" "$ROOT/arena_archive.py" "$ROOT/publish.py" "$ROOT/r2.py" "$APP/Contents/Resources/"
 
-"$APP/Contents/MacOS/ArenaArchive" --make-icon "$BUILD/AppIcon.iconset"
+"$APP/Contents/MacOS/Channel" --make-icon "$BUILD/AppIcon.iconset"
 iconutil -c icns -o "$APP/Contents/Resources/AppIcon.icns" "$BUILD/AppIcon.iconset"
 rm -rf "$BUILD/AppIcon.iconset"
 
@@ -30,8 +30,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <dict>
   <key>CFBundleName</key><string>CHANNEL</string>
   <key>CFBundleDisplayName</key><string>CHANNEL</string>
+  <!-- Kept from the app's first name: the settings (iCloud mode, archive folder) live under it. -->
   <key>CFBundleIdentifier</key><string>studio.oxoy.arena-archive</string>
-  <key>CFBundleExecutable</key><string>ArenaArchive</string>
+  <key>CFBundleExecutable</key><string>Channel</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>

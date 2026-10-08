@@ -1,6 +1,11 @@
-# Are.na Archive
+# Channel
 
-A one-time, public Are.na archive importer with a local browser.
+Your Are.na archive as a Mac app, **CHANNEL**, and online at
+**channel.innercity-life.com**, one of the innercity-life.com sites. The online
+version shows only the channels you starred as favorites, and it is read-only.
+Edit on the Mac and it publishes the favorites (see [Online](#online-channelinnercity-lifecom)).
+
+It started as a one-time Are.na importer with a local browser.
 
 ## Usage
 
@@ -94,6 +99,80 @@ at the iCloud folder:
 cd ~/Library/Mobile\ Documents/com~apple~CloudDocs/CHANNEL
 python3 /path/to/arena_archive.py import maus-cats --database archive.db --assets assets
 ```
+
+## Online (channel.innercity-life.com)
+
+The online Channel runs the same `server.py` as the app, read-only, on a copy
+of the archive that holds only your favorite channels.
+
+- **Publishing.** `publish.py` copies the favorite channels, their blocks and
+  their files (with thumbnails) to the shared R2 bucket `innercity-life` under
+  `channel/`. Nothing else leaves the Mac: other channels, nested channels that
+  aren't favorites, and the raw Are.na data are left out. Unstar a channel and
+  its files are removed online on the next publish.
+- **When.** The app publishes after it writes a change back to iCloud (at most
+  once a minute) and when it opens. **CHANNEL › Publish Favorites Online**
+  publishes right away and tells you what changed. The log is in
+  `~/Library/Application Support/ArenaArchive/publish.log`. From the project
+  folder, `python3 publish.py` does the same from the iCloud archive.
+- **Online.** `api/index.py` is a Vercel Python function that wraps
+  `server.py`'s handler. It downloads `channel/archive.db` to `/tmp` and checks
+  for a newer one every 30 seconds. Images and files redirect to signed R2
+  links, and only for files the published database lists.
+- **Login.** Every page needs the hub's passkey login: the `icl_auth` cookie,
+  checked with `AUTH_PUBLIC_JWK` (`session_token.py`, from artdoc). Without
+  it you go to www.innercity-life.com/login and come back after. Without
+  `AUTH_PUBLIC_JWK` the site answers 503.
+
+### Set up
+
+```bash
+vercel link --yes --project channel
+```
+
+```bash
+curl -s https://www.innercity-life.com/api/public-key | vercel env add AUTH_PUBLIC_JWK production
+```
+
+```bash
+./scripts/set-r2-keys.sh
+```
+
+`set-r2-keys.sh` asks for the R2 account, bucket and key (the archive's,
+artdoc's and Texts' token works), sets them on the Vercel project, writes them
+to `.env.local` for `publish.py`, and deploys. On a second Mac that should
+publish too, run `./scripts/set-r2-keys.sh --local-only`. Then add the domain
+`channel.innercity-life.com` to the Vercel project (a CNAME at Namecheap to
+the target Vercel shows) and publish once:
+
+```bash
+python3 publish.py
+```
+
+`.vercelignore` uploads only the code (`api/`, `server.py`, `style.css`,
+`r2.py`, `session_token.py`). The archive reaches the site only through R2.
+
+### Try it locally
+
+```bash
+python3 publish.py --out /tmp/channel-store
+```
+
+```bash
+CHANNEL_STORE=/tmp/channel-store python3 api/index.py
+```
+
+Then open <http://127.0.0.1:8770>. Locally it runs without the login.
+
+## Tests
+
+```bash
+python3 -m unittest
+```
+
+`test_online.py` checks the R2 signatures against AWS's examples, that only
+favorites are published, and the online site. Its login test needs
+`cryptography` and is skipped without it.
 
 ## Importer
 

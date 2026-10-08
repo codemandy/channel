@@ -1,4 +1,4 @@
-// Are.na Archive — a small native shell around server.py.
+// CHANNEL — a small native shell around server.py.
 //
 // Build with ./mac/build.sh (Command Line Tools only, no Xcode).
 //
@@ -10,6 +10,9 @@
 // local copy of archive.db and writes it back to iCloud, because iCloud syncs
 // whole files and would otherwise clobber a live SQLite database. A lock file
 // in the iCloud folder tells the other Mac the archive is in use.
+//
+// After each write-back the app runs publish.py, which copies the favorite
+// channels to R2 for the online Channel at channel.innercity-life.com.
 
 import AppKit
 import CryptoKit
@@ -36,6 +39,7 @@ enum Paths {
     static let lock = cloud.appendingPathComponent("lock.json")
     // One file per Mac, so the two Macs never write the same file.
     static let versions = cloud.appendingPathComponent("versions")
+    // Named after the app's first name; kept so existing Macs find their data.
     static let support = environment["ARENA_SUPPORT"].map { URL(fileURLWithPath: $0) }
         ?? home.appendingPathComponent("Library/Application Support/ArenaArchive")
     static let localDB = support.appendingPathComponent("archive.db")
@@ -44,7 +48,13 @@ enum Paths {
     static let upload = support.appendingPathComponent("upload.db")
     static let log = support.appendingPathComponent("server.log")
     static let thumbs = support.appendingPathComponent("thumbs")
+    static let publishState = support.appendingPathComponent("publish-state.json")
+    static let publishLog = support.appendingPathComponent("publish.log")
 }
+
+let python3 = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]
+    .first { fm.isExecutableFile(atPath: $0) } ?? "/usr/bin/python3"
+let onlineURL = URL(string: "https://channel.innercity-life.com")!
 
 // MARK: - Files
 
@@ -378,9 +388,7 @@ final class Server {
         guard let script = Bundle.main.url(forResource: "server", withExtension: "py") else {
             throw SyncError("server.py is missing from the app bundle. Rebuild with mac/build.sh.")
         }
-        let python = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]
-            .first { fm.isExecutableFile(atPath: $0) } ?? "/usr/bin/python3"
-        process.executableURL = URL(fileURLWithPath: python)
+        process.executableURL = URL(fileURLWithPath: python3)
         process.arguments = [script.path]
         var environment = ProcessInfo.processInfo.environment
         environment["ARENA_DATABASE"] = database.path
@@ -433,6 +441,103 @@ final class Server {
     }
 }
 
+// MARK: - Publishing
+
+/// Runs publish.py, which puts the favorite channels online at
+/// channel.innercity-life.com (R2 under channel/). One run at a time; asking
+/// while one runs, or within a minute of the last, queues one more run.
+/// The R2 keys are in .env.local in the project folder (scripts/set-r2-keys.sh).
+final class Publisher {
+    struct Archive { let database: URL; let assets: URL; let thumbs: URL }
+    enum Outcome { case published(String), notConfigured, failed(String) }
+
+    static let minimumInterval: TimeInterval = 60
+    static var envFile: URL? { AppVersion.sourcePath?.appendingPathComponent(".env.local") }
+    static var configured: Bool { envFile.map { fm.fileExists(atPath: $0.path) } ?? false }
+
+    private let archive: () -> Archive?
+    private var running = false
+    private var queued = false
+    private var lastRun = Date.distantPast
+
+    init(archive: @escaping () -> Archive?) { self.archive = archive }
+
+    /// After a change was saved. Quiet: failures only go to publish.log.
+    func publishSoon() {
+        guard Publisher.configured else { return }
+        if running || queued { queued = true; return }
+        let wait = Publisher.minimumInterval - Date().timeIntervalSince(lastRun)
+        guard wait <= 0 else {
+            queued = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
+                guard let self, self.queued, !self.running else { return }
+                self.queued = false
+                self.run(completion: nil)
+            }
+            return
+        }
+        run(completion: nil)
+    }
+
+    /// From the menu: runs now (or right after the current run) and reports back.
+    func publishNow(completion: @escaping (Outcome) -> Void) {
+        guard Publisher.configured else { return completion(.notConfigured) }
+        if running {
+            queued = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.publishNow(completion: completion) }
+            return
+        }
+        queued = false
+        run(completion: completion)
+    }
+
+    private func run(completion: ((Outcome) -> Void)?) {
+        guard let archive = archive(), let script = Bundle.main.url(forResource: "publish", withExtension: "py"),
+              let envFile = Publisher.envFile else {
+            completion?(.failed("publish.py is missing from the app bundle, or no archive is open."))
+            return
+        }
+        running = true
+        lastRun = Date()
+        DispatchQueue.global(qos: .utility).async {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: python3)
+            process.arguments = [script.path, "--database", archive.database.path, "--assets", archive.assets.path,
+                                 "--thumbs", archive.thumbs.path, "--env", envFile.path, "--state", Paths.publishState.path]
+            var environment = ProcessInfo.processInfo.environment
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            process.environment = environment
+            let output = Pipe()
+            process.standardOutput = output
+            process.standardError = output
+            var text = ""
+            var status: Int32 = -1
+            do {
+                try process.run()
+                text = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                process.waitUntilExit()
+                status = process.terminationStatus
+            } catch {
+                text = error.localizedDescription
+            }
+            let stamp = ISO8601DateFormatter().string(from: Date())
+            if !fm.fileExists(atPath: Paths.publishLog.path) { fm.createFile(atPath: Paths.publishLog.path, contents: nil) }
+            if let log = try? FileHandle(forWritingTo: Paths.publishLog) {
+                log.seekToEndOfFile()
+                log.write(Data("[\(stamp)] exit \(status)\n\(text)\n".utf8))
+                try? log.close()
+            }
+            let last = text.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: "\n").last ?? ""
+            let outcome: Outcome = status == 0 ? .published(last) : status == 2 ? .notConfigured : .failed(String(text.suffix(600)))
+            DispatchQueue.main.async {
+                self.running = false
+                completion?(outcome)
+                if self.queued { self.queued = false; self.publishSoon() }
+            }
+        }
+    }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler {
@@ -449,6 +554,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     var updateStatus: UpdateStatus?
     var updateCheckedAt: Date?
     var checkingForUpdates = false
+    lazy var publisher = Publisher { [weak self] in
+        guard let self, self.server != nil, !self.readOnly else { return nil }
+        if useICloud { return Publisher.Archive(database: Paths.localDB, assets: Paths.cloudAssets, thumbs: Paths.thumbs) }
+        guard let folder = self.localFolder else { return nil }
+        return Publisher.Archive(database: folder.appendingPathComponent("archive.db"), assets: folder.appendingPathComponent("assets"),
+                                 thumbs: folder.appendingPathComponent("thumbs"))
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.mainMenu = makeMenu()
@@ -549,6 +661,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                 DispatchQueue.main.async {
                     self.server = server
                     self.showWebView()
+                    self.publisher.publishSoon()
                 }
             } catch {
                 DispatchQueue.main.async { self.fail("Could not open the archive", error.localizedDescription) }
@@ -660,7 +773,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
                 DispatchQueue.main.async {
                     self.server = server
                     self.showWebView()
-                    if !readOnly { self.startSyncTimer() }
+                    if !readOnly {
+                        self.startSyncTimer()
+                        self.publisher.publishSoon()
+                    }
                     if let message {
                         self.showAlert("Sync conflict", message)
                     } else if let newer {
@@ -789,11 +905,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             }
             writeLock()
             do {
-                if case .conflict(let name) = try Sync.pushIfChanged() {
+                switch try Sync.pushIfChanged() {
+                case .conflict(let name):
                     DispatchQueue.main.async {
                         self.switchToReadOnly()
                         self.showAlert("The archive changed on another Mac", "Your latest changes were saved as “\(name)” in iCloud Drive › CHANNEL. Quit and reopen to load the newest version.")
                     }
+                case .pushed:
+                    DispatchQueue.main.async { self.publisher.publishSoon() }
+                case .unchanged:
+                    break
                 }
             } catch {
                 NSLog("Sync failed: \(error.localizedDescription)")
@@ -1031,6 +1152,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     @objc func zoomIn() { webView.pageZoom = min(webView.pageZoom + 0.1, 3) }
     @objc func zoomOut() { webView.pageZoom = max(webView.pageZoom - 0.1, 0.5) }
     @objc func actualSize() { webView.pageZoom = 1 }
+    @objc func publishOnline() {
+        publisher.publishNow { [weak self] outcome in
+            switch outcome {
+            case .published(let summary):
+                self?.showAlert("Published to channel.innercity-life.com", summary)
+            case .notConfigured:
+                let folder = AppVersion.sourcePath?.path ?? "the project folder"
+                self?.showAlert("Publishing isn't set up on this Mac", "Run scripts/set-r2-keys.sh in \(folder). It saves the R2 key to .env.local, which the app reads to upload your favorite channels.")
+            case .failed(let detail):
+                self?.showAlert("Could not publish", detail)
+            }
+        }
+    }
+
+    @objc func openOnline() { NSWorkspace.shared.open(onlineURL) }
+
     @objc func showInFinder() {
         let database = useICloud ? Paths.cloudDB : localFolder?.appendingPathComponent("archive.db")
         if let database { NSWorkspace.shared.activateFileViewerSelecting([database]) }
@@ -1053,6 +1190,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         main.addItem(submenu(appName, [
             item("About \(appName)", #selector(NSApplication.orderFrontStandardAboutPanel(_:))),
             item("Update \(appName)…", #selector(confirmUpdate)),
+            .separator(),
+            item("Publish Favorites Online", #selector(publishOnline)),
+            item("Open channel.innercity-life.com", #selector(openOnline)),
             .separator(),
             item("Hide \(appName)", #selector(NSApplication.hide(_:)), "h"),
             item("Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option]),
@@ -1099,7 +1239,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 }
 
-// MARK: - Icon (used by build.sh: `ArenaArchive --make-icon <dir.iconset>`)
+// MARK: - Icon (used by build.sh: `Channel --make-icon <dir.iconset>`)
 
 func makeIconSet(at directory: URL) throws {
     try fm.createDirectory(at: directory, withIntermediateDirectories: true)
