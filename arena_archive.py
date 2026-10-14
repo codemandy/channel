@@ -13,6 +13,7 @@ import re
 import sqlite3
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
@@ -167,6 +168,19 @@ def media_url(item: dict) -> str:
     return ""
 
 
+def link_image_url(item: dict) -> str:
+    # Link and embed blocks carry Are.na's picture of the page. The large size is
+    # plenty: the archive scales anything bigger down to 800px for its thumbnails.
+    image = item.get("image")
+    if not isinstance(image, dict):
+        return ""
+    for size in ("large", "medium"):
+        variant = image.get(size)
+        if isinstance(variant, dict) and text(variant.get("src")):
+            return text(variant.get("src"))
+    return text(image.get("src"))
+
+
 def safe_filename(block_id: int, url: str, content_type: str | None) -> str:
     suffix = Path(urlparse(url).path).suffix.lower()
     if not suffix:
@@ -253,7 +267,7 @@ def import_archive(profile: str, database: Path, assets: Path, client: ArenaClie
                 continue
             block_id = int(item["id"])
             kind = block_type(item)
-            url = media_url(item) if kind in {"image", "attachment"} else ""
+            url = media_url(item) if kind in {"image", "attachment"} else link_image_url(item) if kind in {"link", "embed"} else ""
             if kind in {"image", "attachment"} and not url:
                 omitted += 1
                 db.execute("INSERT INTO import_errors(import_id, channel_id, block_id, message) VALUES (?, ?, ?, ?)", (import_id, channel_id, block_id, "missing media URL"))
@@ -277,11 +291,13 @@ def import_archive(profile: str, database: Path, assets: Path, client: ArenaClie
                     content_type, size, path = download(url, target)
                     db.execute("INSERT OR REPLACE INTO assets VALUES (?, ?, ?, ?, ?, ?)", (block_id, str(Path("assets") / filename), url, content_type, size, "available"))
                 except (HTTPError, URLError, OSError, TimeoutError) as error:
-                    omitted += 1
-                    db.execute("DELETE FROM channel_blocks WHERE channel_id = ? AND block_id = ?", (channel_id, block_id))
-                    db.execute("DELETE FROM blocks WHERE id = ? AND NOT EXISTS (SELECT 1 FROM channel_blocks WHERE block_id = ?)", (block_id, block_id))
                     db.execute("INSERT INTO import_errors(import_id, channel_id, block_id, message) VALUES (?, ?, ?, ?)", (import_id, channel_id, block_id, f"media download failed: {error}"))
-                    continue
+                    if kind in {"image", "attachment"}:
+                        omitted += 1
+                        db.execute("DELETE FROM channel_blocks WHERE channel_id = ? AND block_id = ?", (channel_id, block_id))
+                        db.execute("DELETE FROM blocks WHERE id = ? AND NOT EXISTS (SELECT 1 FROM channel_blocks WHERE block_id = ?)", (block_id, block_id))
+                        continue
+                    # A link's picture is optional: keep the block without one.
                 block_ids.add(block_id)
         db.commit()
     finished = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -327,6 +343,52 @@ def repair_attachments(database: Path, assets: Path, dry_run: bool = False) -> d
     return {"repaired": repaired, "failed": failed}
 
 
+def fetch_link_image(block_id: int, url: str, assets: Path) -> tuple[str, str, int]:
+    """Download one link picture, retrying a flaky transfer. Returns (filename, content type, size)."""
+    filename = safe_filename(block_id, url, None)
+    for attempt in range(3):
+        try:
+            content_type, size, _ = download(url, assets / filename)
+        except Exception:
+            if attempt == 2:
+                raise
+            time.sleep(2 ** attempt)
+            continue
+        if not content_type.startswith("image/"):
+            raise RuntimeError(f"expected an image, got {content_type}")
+        return filename, content_type, size
+    raise RuntimeError("unreachable")
+
+
+def backfill_link_images(database: Path, assets: Path, dry_run: bool = False, workers: int = 4) -> dict:
+    """Link and embed blocks imported before their pictures were kept have no asset.
+    Their Are.na JSON already names the picture, so download it without asking the API again."""
+    db = sqlite3.connect(database)
+    db.row_factory = sqlite3.Row
+    rows = db.execute("SELECT b.id, b.title, b.raw_json FROM blocks b LEFT JOIN assets a ON a.block_id = b.id WHERE b.type IN ('link', 'embed') AND a.block_id IS NULL").fetchall()
+    jobs = [(row["id"], row["title"] or str(row["id"]), link_image_url(json.loads(row["raw_json"]))) for row in rows]
+    jobs = [job for job in jobs if job[2]]
+    if dry_run:
+        db.close()
+        return {"pending": len(jobs), "without_picture": len(rows) - len(jobs)}
+    assets.mkdir(parents=True, exist_ok=True)
+    saved, failed = 0, []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fetch_link_image, block_id, url, assets): (block_id, title, url) for block_id, title, url in jobs}
+        for future in as_completed(futures):
+            block_id, title, url = futures[future]
+            try:
+                filename, content_type, size = future.result()
+            except Exception as error:
+                failed.append(f"{title}: {error}")
+                continue
+            db.execute("INSERT OR REPLACE INTO assets VALUES (?, ?, ?, ?, ?, ?)", (block_id, str(Path("assets") / filename), url, content_type, size, "available"))
+            db.commit()
+            saved += 1
+    db.close()
+    return {"saved": saved, "failed": failed}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -339,9 +401,17 @@ def main() -> None:
     repair.add_argument("--database", type=Path, default=Path("archive.db"))
     repair.add_argument("--assets", type=Path, default=Path("assets"))
     repair.add_argument("--dry-run", action="store_true")
+    backfill = sub.add_parser("backfill-link-images")
+    backfill.add_argument("--database", type=Path, default=Path("archive.db"))
+    backfill.add_argument("--assets", type=Path, default=Path("assets"))
+    backfill.add_argument("--workers", type=int, default=4)
+    backfill.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.command == "repair-attachments":
         print(json.dumps(repair_attachments(args.database, args.assets, args.dry_run), indent=2))
+        return
+    if args.command == "backfill-link-images":
+        print(json.dumps(backfill_link_images(args.database, args.assets, args.dry_run, args.workers), indent=2))
         return
     fixture = json.loads(args.fixture.read_text()) if args.fixture else None
     try:
