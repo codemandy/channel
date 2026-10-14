@@ -1071,6 +1071,10 @@ def block_card(row: sqlite3.Row) -> str:
     if asset and row["type"] == "image":
         thumb = "/thumbs/" + asset.removeprefix("assets/")
         visual = f"<img src='{esc(thumb)}' data-full='/{esc(asset)}' alt='{esc(row['title'] or row['author_name'] or kind)}' loading='lazy' decoding='async'>"
+    elif asset and row["type"] in ("link", "embed"):
+        # The page's picture from Are.na; the block's SOURCE link stays in the meta line.
+        thumb = "/thumbs/" + asset.removeprefix("assets/")
+        visual = f"<img src='{esc(thumb)}' data-full='/{esc(asset)}' alt='{esc(row['title'] or row['source_url'] or kind)}' loading='lazy' decoding='async'>"
     elif asset:
         # A div, not a link: attachments open the modal like every other block, and
         # the modal carries the download.
@@ -1084,7 +1088,7 @@ def block_card(row: sqlite3.Row) -> str:
     else:
         visual = f"<div class='empty-block'><span>{kind}</span><strong>{title_markup(row['title'] or row['source_url'] or 'Untitled block')}</strong></div>"
     source = f"<a href='{esc(row['source_url'])}' target='_blank' rel='noreferrer'>SOURCE ↗</a>" if row["source_url"] and row["type"] != "channel" else ""
-    download = f" data-download='/{esc(asset)}'" if asset and row["type"] != "image" else ""
+    download = f" data-download='/{esc(asset)}'" if asset and row["type"] not in ("image", "link", "embed") else ""
     source_attribute = f" data-source='{source_value}'" if source_value else ""
     note = row["note"] if "note" in row.keys() else ""
     note_markup = f"<p class='block-note'{'' if note else ' hidden'}>{esc(note)}</p>"
